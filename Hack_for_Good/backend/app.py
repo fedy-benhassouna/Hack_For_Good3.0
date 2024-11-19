@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import faiss
 import fitz  # PyMuPDF
+import re
 from sentence_transformers import SentenceTransformer
 from tenacity import retry, stop_after_attempt, wait_fixed
 import google.generativeai as genai
@@ -24,7 +25,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configure Google Generative AI (use environment variable for security)
-GOOGLE_API_KEY = "AIzaSyCKB3FGS-3NQH6FpkwfD8FUwFGrv-ijq1E"
+GOOGLE_API_KEY = "AIzaSyCYq-AavDWA5RhEoZ0lXBOfWzzOCf8u5dA"
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # Load predictive maintenance model and dataset
@@ -40,88 +41,84 @@ data.rename(columns={
     "sensor_38": "vibration"
 }, inplace=True)
 
-# Initialize SentenceTransformer for embeddings
-class GeminiEmbeddingFunction:
-    def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-    def __call__(self, input_texts):
-        # Supports batch processing
-        return self.model.encode(input_texts, convert_to_tensor=False)
-
-embed_fn = GeminiEmbeddingFunction()
-dimension = 384  # Dimensionality of embeddings
-index = faiss.IndexFlatL2(dimension)
 
 # Read PDF and split into paragraphs for better FAISS indexing
 def read_pdf(file_path):
-    """
-    Read a PDF file and extract text content with proper paragraph handling.
-    
-    Args:
-        file_path (str): Path to the PDF file
-    
-    Returns:
-        list: List of text paragraphs from the PDF
-    """
     try:
+        # Open the PDF
         doc = fitz.open(file_path)
-        paragraphs = []
-        
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            
-            # Get text blocks with more detailed information
-            blocks = page.get_text("dict")["blocks"]
-            
-            for block in blocks:
-                if "lines" in block:
-                    # Process each line in the block
-                    for line in block["lines"]:
-                        if "spans" in line:
-                            # Combine all spans in the line
-                            line_text = " ".join(span["text"] for span in line["spans"])
-                            if line_text.strip():
-                                paragraphs.append(line_text.strip())
-                
-                # Add a separator between different blocks if they're not empty
-                if paragraphs and paragraphs[-1]:
-                    paragraphs.append("")
-        
-        # Clean up the paragraphs
-        # Remove empty strings and join consecutive paragraphs
-        cleaned_paragraphs = []
-        current_paragraph = ""
-        
-        for p in paragraphs:
-            if p.strip():
-                if current_paragraph:
-                    current_paragraph += " " + p.strip()
-                else:
-                    current_paragraph = p.strip()
-            elif current_paragraph:
-                cleaned_paragraphs.append(current_paragraph)
-                current_paragraph = ""
-        
-        # Add the last paragraph if it exists
-        if current_paragraph:
-            cleaned_paragraphs.append(current_paragraph)
-        
-        # Filter out any remaining empty paragraphs and very short strings (likely artifacts)
-        final_paragraphs = [p for p in cleaned_paragraphs if len(p.strip()) > 10]
-        
-        doc.close()
-        return final_paragraphs
-        
+        print(f"Total pages in PDF: {len(doc)}")
+
+        text = ""
+        for page_num, page in enumerate(doc, 1):
+            page_text = page.get_text()
+            print(f"Page {page_num} text length: {len(page_text)}")
+            text += page_text
+
+        print(f"Total text length: {len(text)}")
+
+        # Split documents
+        documents = re.split(r'\n\s*\n', text)
+
+        # Clean documents
+        documents = [
+            re.sub(r'\s+', ' ', doc).strip()
+            for doc in documents
+            if doc.strip()
+        ]
+
+        print(f"Number of document segments: {len(documents)}")
+
+        # Optional: Print first few documents for inspection
+        for i, doc in enumerate(documents[:5], 1):
+            print(f"Document {i} (length {len(doc)}):\n{doc[:200]}...\n")
+
+        return documents
+
     except Exception as e:
-        print(f"Error reading PDF: {str(e)}")
+        print(f"Error reading PDF: {e}")
         return []
+
+# Usage
+# documents = read_pdf('your_file.pdf')
+
 
 # Prepare FAISS index
 documents = read_pdf('Hack_for_Good/PumpO/pompe1.pdf')
-embeddings = embed_fn(documents)
-embeddings = np.array(embeddings).astype(np.float32)
+
+# Check if documents is empty and provide a useful message
+if not documents:
+    print("No text found in the PDF. Check if the file is valid or if the extraction method is appropriate.")
+
+# Initialize SentenceTransformer for embeddings
+class GeminiEmbeddingFunction:
+    def __init__(self):
+        # Initialize the SentenceTransformer model
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.document_mode = False
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    def __call__(self, input):
+        # Generate embeddings for the given input text
+        embeddings = self.model.encode(input, convert_to_tensor=True)
+        return embeddings
+
+embed_fn = GeminiEmbeddingFunction()
+
+# Embed the documents individually
+embeddings = []
+for doc in documents:
+    doc_embedding = embed_fn([doc])  # Generate embedding for each docume+nt
+    embeddings.append(doc_embedding[0])  # Append each embedding to the list
+
+# Convert embeddings to a numpy array
+embeddings = np.array(embeddings)
+
+# Check the shape of embeddings (should be (num_documents, embedding_dimension))
+print("Shape of embeddings:", embeddings.shape)
+
+# Add the embeddings to the FAISS index
+index = faiss.IndexFlatL2(embeddings.shape[1])  # L2 distance for cosine similarity
 index.add(embeddings)
 
 # Chatbot route
@@ -132,21 +129,32 @@ def chatbot():
         if not user_query:
             return jsonify({'error': 'Query is required'}), 400
         
-        # Generate query embedding
-        query_embedding = embed_fn([user_query])
-        query_embedding = np.array(query_embedding).astype(np.float32)
-        
-        # Search FAISS index for the best match
-        D, I = index.search(query_embedding, k=1)
-        best_doc = documents[I[0][0]]
+   
+        # Generate embedding for the query
+        query_embedding = embed_fn([user_query])  # Embedding for the query
+        query_embedding = np.array(query_embedding).astype(np.float32)  # Convert to numpy array
+
+    # Search the FAISS index for the most similar document
+        D, I = index.search(query_embedding, k=1)  # k=1 for top 1 document
+
+    # Fetch the most similar document
+        passage = documents[I[0][0]]  # Retrieve the most similar document
+
+    # Format the passage and query for the prompt
+        passage_oneline = passage.replace("\n", " ")
+
         
         # Generate response using Google Generative AI
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
-        prompt = f"""
-        You are an expert in water pumps. Answer the following question based on the passage provided:
+        prompt = f"""You are an expert in water pumps with a deep understanding of their operation, maintenance, troubleshooting, and safety protocols. \
+        Your responses should provide detailed, technical information, focusing on water pump efficiency, performance optimization, \
+        and preventive maintenance. Use the following pieces of information to answer the user's question.
+        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
         QUESTION: {user_query}
-        PASSAGE: {best_doc}
+        PASSAGE: {passage_oneline}
         """
+
         response = model.generate_content(prompt)
         
         return jsonify({'response': response.text})
